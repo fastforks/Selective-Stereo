@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from core.update import BasicSelectiveMultiUpdateBlock, SpatialAttentionExtractor, ChannelAttentionEnhancement
 from core.extractor import MultiBasicEncoder, Feature
-from core.geometry import Combined_Geo_Encoding_Volume
+from core.geometry import Combined_Geo_Encoding_Volume, FastGeoEncodingVolume
 from core.submodule import *
 
 
@@ -146,6 +146,67 @@ class IGEVStereo(nn.Module):
 
         return up_disp
 
+
+    # ------------------------------------------------------------------------------------------- inference path
+    @torch.no_grad()
+    def forward_fast(self, image1, image2, iters=32):
+        """Test-mode forward after core.inference.prepare_inference() (port of IGEV-general forward_fast): pure fp16
+        NHWC, fp32 disparity state / lookup / softmax / upsampling, no host syncs in the loop, mask features only after
+        the last iteration, constant context part of the selective GRU convs computed once."""
+        from core.inference import prepare_context_selective, update_block_selective
+        dt = self.inf_dtype
+        mf2 = torch.channels_last
+        D = self.args.max_disp // 4
+        im1 = (2 * (image1 / 255.0) - 1.0).to(dt).contiguous(memory_format=mf2)
+        im2 = (2 * (image2 / 255.0) - 1.0).to(dt).contiguous(memory_format=mf2)
+
+        fr = self.feature(im2)
+        stem_4y = self.stem_4(self.stem_2(im2))
+        match_right = self.desc(self.conv(torch.cat((fr[0], stem_4y), 1)))
+        del fr, stem_4y, im2
+        features_left = self.feature(im1)
+        stem_2x = self.stem_2(im1)
+        stem_4x = self.stem_4(stem_2x)
+        features_left[0] = torch.cat((features_left[0], stem_4x), 1)
+        del stem_4x
+        match_left = self.desc(self.conv(features_left[0]))
+
+        gwc_volume = build_gwc_volume_fast(match_left, match_right, D, 8, True)
+        gwc_volume = self.corr_stem(gwc_volume)
+        gwc_volume = self.corr_feature_att(gwc_volume, features_left[0])
+        geo_encoding_volume = self.cost_agg(gwc_volume, features_left)
+        del gwc_volume, features_left
+        prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1).float(), dim=1)
+        init_disp = disparity_regression(prob, D)
+        del prob
+
+        geo_fn = FastGeoEncodingVolume(match_left, match_right, geo_encoding_volume, radius=self.args.corr_radius,
+                                       num_levels=self.args.corr_levels, out_dtype=dt, use_kernel=True)
+        del geo_encoding_volume, match_left, match_right
+
+        cnet_list = self.cnet(im1, num_layers=self.args.n_gru_layers)
+        del im1
+        net_list = [torch.tanh(x[0]).contiguous(memory_format=mf2) for x in cnet_list]
+        inp_list = [torch.relu(x[1]) for x in cnet_list]
+        del cnet_list
+        inp_list = [(self.cam(x) * x).contiguous(memory_format=mf2) for x in inp_list]
+        att = [self.sam(x) for x in inp_list]
+        ctx = prepare_context_selective(self, inp_list)
+        del inp_list
+
+        b, _, h, w = init_disp.shape
+        disp = init_disp.float()
+        disp_h = torch.empty((b, 1, h, w), device=disp.device, dtype=dt, memory_format=mf2)
+        for itr in range(iters):
+            geo_feat = geo_fn(disp)
+            disp_h.copy_(disp)
+            last = itr == iters - 1
+            net_list, mask_feat_4, delta_disp = update_block_selective(self.update_block, net_list, ctx, att, geo_feat, disp_h, last)
+            disp = disp + delta_disp.float()
+
+        xspx = self.spx_2_gru(mask_feat_4, stem_2x)
+        spx_pred = F.softmax(self.spx_gru(xspx).float(), 1)
+        return context_upsample(disp * 4., spx_pred).unsqueeze(1)
 
     def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
         """ Estimate disparity between pair of frames """
